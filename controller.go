@@ -1,63 +1,121 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	apps_v1 "k8s.io/api/apps/v1"
+	core_v1 "k8s.io/api/core/v1"
+	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	v1 "k8s.io/client-go/informers/apps/v1"
+	corev1Informers "k8s.io/client-go/informers/core/v1"
 	"k8s.io/client-go/kubernetes"
-	appsv1listers "k8s.io/client-go/listers/apps/v1"
+	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	"time"
 )
 
 type Controller struct {
-	clientset             kubernetes.Clientset
-	appLister             appsv1listers.DeploymentLister
-	deploymentCacheSynced cache.InformerSynced
-	taskQueue             workqueue.RateLimitingInterface
+	clientset      kubernetes.Clientset
+	podLister      corev1listers.PodLister
+	cacheSynced    cache.InformerSynced
+	taskQueue      workqueue.Interface
+	controllerDone chan struct{}
 }
 
-func NewController(clientset kubernetes.Clientset, deploymentInformer v1.DeploymentInformer) *Controller {
+func NewController(clientset kubernetes.Clientset, podInformer corev1Informers.PodInformer, controllerDone chan struct{}) *Controller {
 	c := &Controller{
-		clientset:             clientset,
-		appLister:             deploymentInformer.Lister(),
-		deploymentCacheSynced: deploymentInformer.Informer().HasSynced,
-		taskQueue:             workqueue.NewRateLimitingQueue(workqueue.DefaultControllerRateLimiter()),
+		clientset:      clientset,
+		podLister:      podInformer.Lister(),
+		cacheSynced:    podInformer.Informer().HasSynced,
+		taskQueue:      workqueue.New(),
+		controllerDone: controllerDone,
 	}
 
-	deploymentInformer.Informer().AddEventHandler(
+	podInformer.Informer().AddEventHandler(
 		cache.ResourceEventHandlerFuncs{
 			AddFunc: func(addObj interface{}) {
-				deployment := addObj.(*apps_v1.Deployment)
-				fmt.Printf("Deployment was added: %s\n", deployment.ObjectMeta.Name)
-			},
-			DeleteFunc: func(delObj interface{}) {
-				deployment := delObj.(*apps_v1.Deployment)
-				fmt.Printf("Deployment was deleted: %s\n", deployment.ObjectMeta.Name)
+				pod := addObj.(*core_v1.Pod)
+				if pod.OwnerReferences == nil {
+					c.addPod(addObj)
+					fmt.Printf("Added pod %s\n", pod.Name)
+				}
 			},
 		})
 
 	return c
 }
 
-func (c *Controller) run(channel <-chan struct{}) {
+func (c *Controller) run() {
 	fmt.Printf("Starting Controller...\n")
 	fmt.Printf("Waiting for Cache to Sync...\n")
 	// Wait to see if the Informer Cache has synced or initialized.
-	hasSynced := cache.WaitForCacheSync(channel, c.deploymentCacheSynced)
+	hasSynced := cache.WaitForCacheSync(c.controllerDone, c.cacheSynced)
 
 	if !hasSynced {
 		fmt.Printf("Error Syncing Cache...\n")
 	}
 
-	// Wait until the "channel" is closed
-	go wait.Until(c.work, time.Second*1, channel)
+	fmt.Printf("Cacehe has Synced!\n")
 
-	<-channel
+	// Wait until the "channel" is closed
+	go wait.Until(c.work, time.Second*1, c.controllerDone)
+
+	<-c.controllerDone
 }
 
+// Get values from the work queue
 func (c *Controller) work() {
+	// Get a "task" from the queue.
+	task, shutdown := c.taskQueue.Get()
+
+	if shutdown {
+		close(c.controllerDone)
+	}
+
+	// key is namespace/name of item
+	key, _ := cache.MetaNamespaceKeyFunc(task)
+
+	// Split key into namespace and name variables
+	namespace, name, _ := cache.SplitMetaNamespaceKey(key)
+
+	err := c.syncPod(namespace, name)
+
+	if err != nil {
+		fmt.Printf("Error syncing pod. Error: %s\n", err.Error())
+		close(c.controllerDone)
+	}
+
+	c.taskQueue.Done(task)
+}
+
+func (c *Controller) syncPod(namespace, name string) error {
+	// Get a pod for the namespace and name
+	pod, err := c.podLister.Pods(namespace).Get(name)
+
+	if err != nil {
+		return err
+	}
+
+	// Create a ReplicaSet
+	var replicas int32
+	replicas = 3
+	replicaSetObj := NewReplicaSet(pod, &replicas)
+	replicaSet, err := c.clientset.AppsV1().ReplicaSets(namespace).Create(context.Background(), replicaSetObj, meta_v1.CreateOptions{})
+	if err != nil {
+		fmt.Printf("Error creating ReplicaSet. Error: %s", err.Error())
+		return err
+	}
+	fmt.Printf("-- ReplicaSet created: %s --\n", replicaSet.Name)
+	return nil
+}
+
+func (c *Controller) addPod(task interface{}) {
+	pod, ok := task.(*core_v1.Pod)
+
+	if ok {
+		c.taskQueue.Add(pod)
+	} else {
+		fmt.Printf("Error in addPod for %v", pod)
+	}
 
 }
