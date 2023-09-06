@@ -48,6 +48,7 @@ func NewController(clientset kubernetes.Clientset, podInformer corev1Informers.P
 func (c *Controller) run() {
 	fmt.Printf("Starting Controller...\n")
 	fmt.Printf("Waiting for Cache to Sync...\n")
+
 	// Wait to see if the Informer Cache has synced or initialized.
 	hasSynced := cache.WaitForCacheSync(c.controllerDone, c.cacheSynced)
 
@@ -57,7 +58,7 @@ func (c *Controller) run() {
 
 	fmt.Printf("Cacehe has Synced!\n")
 
-	// Wait until the "channel" is closed
+	// Wait until the channel is closed
 	go wait.Until(c.work, time.Second*1, c.controllerDone)
 
 	<-c.controllerDone
@@ -92,6 +93,7 @@ func (c *Controller) syncPod(namespace, name string) error {
 	// Get a pod for the namespace and name
 	pod, err := c.podLister.Pods(namespace).Get(name)
 
+	// Would happen if you try to get a pod that was just deleted
 	if err != nil {
 		return err
 	}
